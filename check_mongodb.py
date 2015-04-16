@@ -16,6 +16,8 @@
 #   - @jbraeuer on github
 #   - Dag Stockstad <dag.stockstad@gmail.com>
 #   - @Andor on github
+#   - Steven Richards - Captainkrtek on github
+#   - Max Vernimmen
 #
 # USAGE
 #
@@ -28,6 +30,8 @@ import optparse
 import textwrap
 import re
 import os
+import json
+import datetime
 
 try:
     import pymongo
@@ -130,7 +134,7 @@ def main(argv):
     p.add_option('-C', '--critical', action='store', dest='critical', default=None, help='The critical threshold we want to set')
     p.add_option('-A', '--action', action='store', type='choice', dest='action', default='connect', help='The action you want to take',
                  choices=['connect', 'connections', 'replication_lag', 'replication_lag_percent', 'replset_state', 'memory', 'memory_mapped', 'lock',
-                          'flushing', 'last_flush_time', 'index_miss_ratio', 'databases', 'collections', 'database_size', 'database_indexes', 'collection_indexes',
+                          'flushing', 'last_flush_time', 'index_miss_ratio', 'databases', 'collections', 'database_size', 'database_indexes', 'collection_indexes', 'collection_size',
                           'queues', 'oplog', 'journal_commits_in_wl', 'write_data_files', 'journaled', 'opcounters', 'current_lock', 'replica_primary', 'page_faults',
                           'asserts', 'queries_per_second', 'page_faults', 'chunks_balance', 'connect_primary', 'collection_state', 'row_count', 'replset_quorum'])
     p.add_option('--max-lag', action='store_true', dest='max_lag', default=False, help='Get max replication lag (for replication_lag action only)')
@@ -143,6 +147,7 @@ def main(argv):
     p.add_option('-q', '--querytype', action='store', dest='query_type', default='query', help='The query type to check [query|insert|update|delete|getmore|command] from queries_per_second')
     p.add_option('-c', '--collection', action='store', dest='collection', default='admin', help='Specify the collection to check')
     p.add_option('-T', '--time', action='store', type='int', dest='sample_time', default=1, help='Time used to sample number of pages faults')
+    p.add_option('-Q', '--custom-query', action='store', type='string', dest='custom_query', default='', help='Custom query to count')
 
     options, arguments = p.parse_args()
     host = options.host
@@ -152,6 +157,7 @@ def main(argv):
     query_type = options.query_type
     collection = options.collection
     sample_time = options.sample_time
+    custom_query = json.loads(options.custom_query, object_hook=json_hook)
     if (options.action == 'replset_state'):
         warning = str(options.warning or "")
         critical = str(options.critical or "")
@@ -223,6 +229,8 @@ def main(argv):
         return check_database_indexes(con, database, warning, critical, perf_data)
     elif action == "collection_indexes":
         return check_collection_indexes(con, database, collection, warning, critical, perf_data)
+    elif action == "collection_size":
+        return check_collection_size(con, database, collection, warning, critical, perf_data)
     elif action == "journaled":
         return check_journaled(con, warning, critical, perf_data)
     elif action == "write_data_files":
@@ -244,7 +252,7 @@ def main(argv):
     elif action == "collection_state":
         return check_collection_state(con, database, collection)
     elif action == "row_count":
-        return check_row_count(con, database, collection, warning, critical, perf_data)
+        return check_row_count(con, database, collection, custom_query, warning, critical, perf_data)
     elif action == "replset_quorum":
         return check_replset_quorum(con, perf_data)
     else:
@@ -373,7 +381,7 @@ def check_rep_lag(con, host, port, warning, critical, percent, perf_data, max_la
             for member in rs_status["members"]:
                 if member["stateStr"] == "PRIMARY":
                     primary_node = member
-                if member["name"].split(':')[0] == host and int(member["name"].split(':')[1]) == port:
+                if member.get('self') == True:
                     host_node = member
 
             # Check if we're in the middle of an election and don't have a primary
@@ -499,8 +507,22 @@ def check_memory(con, warning, critical, perf_data, mapped_memory):
     #
     # These thresholds are basically meaningless, and must be customized to your system's ram
     #
-    warning = warning or 8
-    critical = critical or 16
+
+    # Get the total system merory and calculate based on that how much memory used by Mongodb is ok or not.
+    meminfo = open('/proc/meminfo').read()
+    matched = re.search(r'^MemTotal:\s+(\d+)', meminfo)
+    if matched: 
+        mem_total_kB = int(matched.groups()[0])
+
+    # Old way
+    #critical = critical or 16
+    # The new way. if using >80% then warn, if >90% then critical level
+    warning = warning or (mem_total_kB * 0.8) / 1024.0 / 1024.0
+    critical = critical or (mem_total_kB * 0.9) / 1024.0 / 1024.0
+
+    # debugging
+    #print "mem total: {0}kb, warn: {1}GB, crit: {2}GB".format(mem_total_kB,warning, critical)
+
     try:
         data = get_server_status(con)
         if not data['mem']['supported'] and not mapped_memory:
@@ -591,7 +613,12 @@ def check_lock(con, warning, critical, perf_data):
         #
         # calculate percentage
         #
-        lock_percentage = float(data['globalLock']['lockTime']) / float(data['globalLock']['totalTime']) * 100
+        lockTime = data['globalLock']['lockTime']
+        totalTime = data['globalLock']['totalTime']
+        if lockTime > totalTime:
+            lock_percentage = 0.00
+        else:
+            lock_percentage = float(lockTime) / float(totalTime) * 100
         message = "Lock Percentage: %.2f%%" % lock_percentage
         message += performance_data(perf_data, [("%.2f" % lock_percentage, "lock_percentage", warning, critical)])
         return check_levels(lock_percentage, warning, critical, message)
@@ -888,6 +915,28 @@ def check_queues(con, warning, critical, perf_data):
     except Exception, e:
         return exit_with_general_critical(e)
 
+def check_collection_size(con, database, collection, warning, critical, perf_data):
+    warning = warning or 100
+    critical = critical or 1000
+    perfdata = ""
+    try:
+        set_read_preference(con.admin)
+        data = con[database].command('collstats', collection)
+        size = data['size'] / 1024 / 1024
+        if perf_data:
+            perfdata += " | collection_size=%i;%i;%i" % (size, warning, critical)
+
+        if size >= critical:
+            print "CRITICAL - %s.%s size: %.0f MB %s" % (database, collection, size, perfdata)
+            return 2
+        elif size >= warning:
+            print "WARNING - %s.%s size: %.0f MB %s" % (database, collection, size, perfdata)
+            return 1
+        else:
+            print "OK - %s.%s size: %.0f MB %s" % (database, collection, size, perfdata)
+            return 0
+    except Exception, e:
+        return exit_with_general_critical(e)
 
 def check_queries_per_second(con, query_type, warning, critical, perf_data):
     warning = warning or 250
@@ -1308,9 +1357,9 @@ def check_collection_state(con, database, collection):
         return exit_with_general_critical(e)
 
 
-def check_row_count(con, database, collection, warning, critical, perf_data):
+def check_row_count(con, database, collection, custom_query, warning, critical, perf_data):
     try:
-        count = con[database][collection].count()
+        count = con[database][collection].find(custom_query).count()
         message = "Row count: %i" % (count)
         message += performance_data(perf_data, [(count, "row_count", warning, critical)])
 
@@ -1318,7 +1367,6 @@ def check_row_count(con, database, collection, warning, critical, perf_data):
 
     except Exception, e:
         return exit_with_general_critical(e)
-
 
 def build_file_name(host, action):
     #done this way so it will work when run independently and from shell
@@ -1403,6 +1451,15 @@ def replication_get_time_diff(con):
     tlast = last["ts"]
     delta = tlast.time - tfirst.time
     return delta
+
+def json_hook(json_dict):
+    for (key, value) in json_dict.items():
+        try:
+            json_dict[key] = x.encode('ascii')
+            json_dict[key] = datetime.datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+        except:
+            pass
+    return json_dict
 
 #
 # main app
